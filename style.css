@@ -91,37 +91,20 @@
 .lmlog-line {
     white-space: pre-wrap;
     word-break: break-word;
-    border-bottom: 1px dotted rgba(255, 255, 255, 0.06);
-    padding: 2px 0;
+    padding: 0 0 0 6px;
+    border-left: 3px solid transparent;
 }
 
-.lmlog-time {
-    opacity: 0.55;
-    margin-right: 6px;
+.lmlog-source-server {
+    border-left-color: rgba(33, 150, 243, 0.55);
 }
 
-.lmlog-tag {
-    display: inline-block;
-    min-width: 44px;
-    text-align: center;
-    border-radius: 4px;
-    padding: 0 4px;
-    margin-right: 6px;
-    font-size: 10px;
-    text-transform: uppercase;
-    background: rgba(255, 255, 255, 0.1);
+.lmlog-source-model {
+    border-left-color: rgba(156, 39, 176, 0.55);
 }
 
-.lmlog-source-server .lmlog-tag {
-    background: rgba(33, 150, 243, 0.35);
-}
-
-.lmlog-source-model .lmlog-tag {
-    background: rgba(156, 39, 176, 0.35);
-}
-
-.lmlog-source-info .lmlog-tag {
-    background: rgba(255, 255, 255, 0.15);
+.lmlog-source-info {
+    border-left-color: rgba(255, 255, 255, 0.25);
 }
 
 .lmlog-toggle-btn {

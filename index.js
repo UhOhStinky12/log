@@ -13,9 +13,12 @@ const defaultSettings = {
     // The extension pings each one and connects to whichever responds first,
     // so the same setting works whether you're on your PC (127.0.0.1 or
     // LAN IP) or your phone (LAN IP only).
-    bridgeUrls: "http://127.0.0.1:6172, http://10.0.0.46:6172",
+    bridgeUrls: "http://127.0.0.1:6172, http://192.168.1.20:6172",
     autoConnect: false,
-    maxLines: 500,
+    // 0 = unlimited: keep every line for the whole session (matches "don't
+    // delete any logs"). Set a positive number only if you need to cap
+    // memory/DOM usage for very long-running sessions.
+    maxLines: 0,
     showServer: true,
     showModel: true,
     autoscroll: true,
@@ -25,7 +28,10 @@ const defaultSettings = {
 let eventSource = null;
 let reconnectTimer = null;
 let manuallyDisconnected = false;
-let logBuffer = [];
+// Full history of every line received this session (not trimmed unless
+// maxLines > 0). This is what filtering/exporting operate on, so switching
+// a filter or reconnecting never loses anything already received.
+let allEvents = [];
 
 function getSettings() {
     if (!extension_settings[extensionName]) {
@@ -95,58 +101,87 @@ function escapeHtml(str) {
         .replace(/>/g, "&gt;");
 }
 
-function formatEvent(evt) {
-    const time = evt.time ? new Date(evt.time * 1000).toLocaleTimeString() : "";
-    const source = evt.source || "info";
-    let body = "";
-
-    if (evt.type === "raw") {
-        body = evt.text || "";
-    } else if (source === "model") {
-        const kind = evt.data && evt.data.type ? evt.data.type : "model";
-        const model = evt.data && evt.data.modelIdentifier ? evt.data.modelIdentifier : "";
-        const text = evt.data && (evt.data.input || evt.data.output) || "";
-        body = `[${kind}] ${model ? model + " " : ""}${text}`;
-    } else if (source === "server") {
-        body = (evt.data && (evt.data.message || evt.data.text)) || JSON.stringify(evt.data || {});
-    } else {
-        body = JSON.stringify(evt.data || evt);
-    }
-
-    return { time, source, body };
+// The bridge now sends the line exactly as LM Studio's own `lms log stream`
+// printed it (no JSON parsing/reformatting), so what you see here has the
+// same structure as LM Studio's own developer logs. We only strip a
+// trailing newline, if any.
+function lineText(evt) {
+    return evt && typeof evt.text === "string" ? evt.text : "";
 }
 
-function renderLine(evt) {
+function passesFilters(evt) {
     const settings = getSettings();
-    const formatted = formatEvent(evt);
-
-    if (formatted.source === "server" && !settings.showServer) return;
-    if (formatted.source === "model" && !settings.showModel) return;
+    if (evt.source === "server" && !settings.showServer) return false;
+    if (evt.source === "model" && !settings.showModel) return false;
 
     const filterText = $("#lmlog_filter").val().toLowerCase().trim();
-    if (filterText && !formatted.body.toLowerCase().includes(filterText) && !formatted.time.includes(filterText)) {
-        return;
+    if (filterText && !lineText(evt).toLowerCase().includes(filterText)) {
+        return false;
     }
+    return true;
+}
 
-    const $line = $(`
-        <div class="lmlog-line lmlog-source-${escapeHtml(formatted.source)}">
-            <span class="lmlog-time">${escapeHtml(formatted.time)}</span>
-            <span class="lmlog-tag">${escapeHtml(formatted.source)}</span>
-            <span class="lmlog-body"></span>
-        </div>
-    `);
-    $line.find(".lmlog-body").text(formatted.body);
+function buildLineElement(evt) {
+    const $line = $(`<div class="lmlog-line lmlog-source-${escapeHtml(evt.source || "info")}"></div>`);
+    // Blank lines are meaningful spacing in LM Studio's own log output
+    // (e.g. between model log entries), so preserve them as empty rows
+    // rather than collapsing them.
+    $line.text(lineText(evt));
+    if (lineText(evt) === "") {
+        $line.html("&nbsp;");
+    }
+    return $line;
+}
 
+function appendLineToDom(evt) {
     const $content = $("#lmlog_content");
-    $content.append($line);
+    $content.append(buildLineElement(evt));
 
-    // trim to maxLines
-    const max = Number(settings.maxLines) || 500;
-    while ($content.children().length > max) {
-        $content.children().first().remove();
+    const settings = getSettings();
+    const max = Number(settings.maxLines) || 0;
+    if (max > 0) {
+        while ($content.children().length > max) {
+            $content.children().first().remove();
+        }
     }
 
     if (settings.autoscroll) {
+        $content.scrollTop($content[0].scrollHeight);
+    }
+}
+
+// Called whenever a new event arrives from the bridge: store it (always,
+// unbounded unless the user set a maxLines cap) and render it if it passes
+// the current filters.
+function handleIncomingEvent(evt) {
+    allEvents.push(evt);
+
+    const settings = getSettings();
+    const max = Number(settings.maxLines) || 0;
+    if (max > 0 && allEvents.length > max) {
+        allEvents.splice(0, allEvents.length - max);
+    }
+
+    if (passesFilters(evt)) {
+        appendLineToDom(evt);
+    }
+}
+
+// Fully re-renders the panel from allEvents, applying current filters.
+// Used when the filter text or show-server/show-model toggles change, so
+// nothing already received is lost - it's just hidden/shown.
+function rerenderFromHistory() {
+    const $content = $("#lmlog_content");
+    const fragment = document.createDocumentFragment();
+    for (const evt of allEvents) {
+        if (passesFilters(evt)) {
+            fragment.appendChild(buildLineElement(evt)[0]);
+        }
+    }
+    $content.empty();
+    $content[0].appendChild(fragment);
+
+    if (getSettings().autoscroll) {
         $content.scrollTop($content[0].scrollHeight);
     }
 }
@@ -191,7 +226,7 @@ async function connect() {
     eventSource.onmessage = (e) => {
         try {
             const evt = JSON.parse(e.data);
-            renderLine(evt);
+            handleIncomingEvent(evt);
         } catch (err) {
             // ignore malformed lines / heartbeats
         }
@@ -222,17 +257,12 @@ function disconnect(silent) {
 }
 
 function clearLog() {
+    allEvents = [];
     $("#lmlog_content").empty();
 }
 
 function exportLog() {
-    const text = $("#lmlog_content")
-        .children()
-        .map(function () {
-            return $(this).text();
-        })
-        .get()
-        .join("\n");
+    const text = allEvents.map(lineText).join("\n");
     const blob = new Blob([text], { type: "text/plain" });
     const url = URL.createObjectURL(blob);
     const a = document.createElement("a");
@@ -278,8 +308,9 @@ function buildSettingsPanel() {
                     Autoscroll
                 </label>
 
-                <label for="lmlog_maxlines">Max lines kept</label>
-                <input id="lmlog_maxlines" type="number" class="text_pole" min="50" max="5000" step="50" />
+                <label for="lmlog_maxlines">Max lines kept (0 = unlimited, nothing ever deleted)</label>
+                <input id="lmlog_maxlines" type="number" class="text_pole" min="0" max="1000000" step="100" />
+                <small>Leave at 0 to keep the full session's logs. Only set a limit if you're running SillyTavern for days at a stretch and want to bound memory/DOM usage.</small>
 
                 <div class="lmlog-btn-row">
                     <button id="lmlog_connect_btn" class="menu_button">Connect</button>
@@ -311,18 +342,24 @@ function buildSettingsPanel() {
     $("#lmlog_show_server").on("change", function () {
         settings.showServer = $(this).prop("checked");
         saveSettings();
+        rerenderFromHistory();
     });
     $("#lmlog_show_model").on("change", function () {
         settings.showModel = $(this).prop("checked");
         saveSettings();
+        rerenderFromHistory();
     });
     $("#lmlog_autoscroll").on("change", function () {
         settings.autoscroll = $(this).prop("checked");
         saveSettings();
     });
     $("#lmlog_maxlines").on("change", function () {
-        settings.maxLines = Number($(this).val()) || defaultSettings.maxLines;
+        settings.maxLines = Math.max(0, Number($(this).val()) || 0);
         saveSettings();
+        if (settings.maxLines > 0 && allEvents.length > settings.maxLines) {
+            allEvents.splice(0, allEvents.length - settings.maxLines);
+        }
+        rerenderFromHistory();
     });
 
     $("#lmlog_connect_btn").on("click", connect);
@@ -357,8 +394,7 @@ function buildFloatingPanel() {
     $("#lmlog_panel_clear").on("click", clearLog);
     $("#lmlog_panel_export").on("click", exportLog);
     $("#lmlog_filter").on("input", () => {
-        // re-render nothing retroactively (keep it simple/live-forward);
-        // filter only applies to new incoming lines.
+        rerenderFromHistory();
     });
 
     makeDraggable($("#lmlog_panel_header"), $("#lmlog_panel"));

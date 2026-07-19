@@ -42,6 +42,22 @@ So this extension is one half of a pair:
    floating on screen, to view the live log feed. The panel is draggable and
    works with touch on mobile.
 
+## Log format & retention
+
+- Lines are shown **exactly as LM Studio's own `lms log stream` prints
+  them** - the bridge no longer reformats anything into JSON, so the
+  structure (timestamps, `[INFO][LM STUDIO SERVER]` tags, multi-line model
+  input/output blocks, blank-line spacing) matches LM Studio's own
+  developer logs verbatim. A thin colored border on the left just tells you
+  at a glance whether a line came from the server or model stream.
+- Nothing is deleted by default. "Max lines kept" in the settings defaults
+  to `0` (unlimited) - every line received during the session stays in
+  memory and in the panel. Only set a positive number there if you're
+  running a very long session and want to bound memory/DOM usage.
+- The filter box and the "Show server logs" / "Show model logs" toggles
+  only hide non-matching lines - they don't discard anything, so
+  clearing a filter brings everything back.
+
 ## Notes
 
 - Your phone needs to be able to reach that PC's IP/port - i.e. the same
