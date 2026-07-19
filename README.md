@@ -29,9 +29,13 @@ So this extension is one half of a pair:
 2. On the machine running LM Studio, run `lmstudio_log_bridge.py` (see its own
    instructions). By default it listens on `0.0.0.0:6172`.
 3. Open the SillyTavern **Extensions** panel, find "LM Studio Log Viewer",
-   and set **Bridge URL** to `http://<your-pc-lan-ip>:6172` (use your PC's LAN
-   IP, not `127.0.0.1`, if you're connecting from your phone - e.g.
-   `http://192.168.1.20:6172`).
+   and set **Bridge URL(s)** to a comma-separated list of every address that
+   might reach the bridge, e.g.:
+   `http://127.0.0.1:6172, http://192.168.1.20:6172`
+   The extension pings each one and connects to whichever responds - so the
+   same setting works from your PC's own browser (via `127.0.0.1`) and from
+   your phone (via the LAN IP), without needing to change anything when you
+   switch devices.
 4. Click **Connect**, or check **Auto-connect** so it connects automatically
    whenever SillyTavern loads.
 5. Click **Open Log Panel**, or tap the small terminal-icon button that's now

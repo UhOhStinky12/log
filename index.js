@@ -9,7 +9,11 @@ import { saveSettingsDebounced } from "../../../../script.js";
 const extensionName = "sillytavern-lmstudio-logs";
 
 const defaultSettings = {
-    bridgeUrl: "http://127.0.0.1:6172",
+    // Comma or newline separated list of candidate bridge addresses.
+    // The extension pings each one and connects to whichever responds first,
+    // so the same setting works whether you're on your PC (127.0.0.1 or
+    // LAN IP) or your phone (LAN IP only).
+    bridgeUrls: "http://127.0.0.1:6172, http://10.0.0.46:6172",
     autoConnect: false,
     maxLines: 500,
     showServer: true,
@@ -27,12 +31,50 @@ function getSettings() {
     if (!extension_settings[extensionName]) {
         extension_settings[extensionName] = {};
     }
+    const s = extension_settings[extensionName];
+
+    // migrate old single "bridgeUrl" setting -> new "bridgeUrls" list
+    if (s.bridgeUrl && !s.bridgeUrls) {
+        s.bridgeUrls = s.bridgeUrl;
+        delete s.bridgeUrl;
+    }
+
     for (const key of Object.keys(defaultSettings)) {
-        if (extension_settings[extensionName][key] === undefined) {
-            extension_settings[extensionName][key] = defaultSettings[key];
+        if (s[key] === undefined) {
+            s[key] = defaultSettings[key];
         }
     }
-    return extension_settings[extensionName];
+    return s;
+}
+
+function parseUrlList(raw) {
+    return String(raw || "")
+        .split(/[,\n]/)
+        .map((u) => u.trim().replace(/\/+$/, ""))
+        .filter((u) => u.length > 0);
+}
+
+async function probeUrl(baseUrl, timeoutMs = 2500) {
+    const controller = new AbortController();
+    const timer = setTimeout(() => controller.abort(), timeoutMs);
+    try {
+        const res = await fetch(baseUrl + "/health", { signal: controller.signal, cache: "no-store" });
+        return res.ok;
+    } catch (e) {
+        return false;
+    } finally {
+        clearTimeout(timer);
+    }
+}
+
+async function pickReachableUrl(urls) {
+    for (const url of urls) {
+        // eslint-disable-next-line no-await-in-loop
+        if (await probeUrl(url)) {
+            return url;
+        }
+    }
+    return null;
 }
 
 function saveSettings() {
@@ -109,13 +151,31 @@ function renderLine(evt) {
     }
 }
 
-function connect() {
+async function connect() {
     const settings = getSettings();
     manuallyDisconnected = false;
     disconnect(true);
 
-    const url = settings.bridgeUrl.replace(/\/+$/, "") + "/events";
-    setStatus("Connecting...", "lmlog-status-warn");
+    const candidates = parseUrlList(settings.bridgeUrls);
+    if (candidates.length === 0) {
+        setStatus("No bridge URL(s) configured", "lmlog-status-bad");
+        return;
+    }
+
+    setStatus(`Checking ${candidates.length} address(es)...`, "lmlog-status-warn");
+    const reachable = await pickReachableUrl(candidates);
+
+    if (manuallyDisconnected) return; // user hit disconnect while we were probing
+
+    if (!reachable) {
+        setStatus("No reachable bridge - retrying...", "lmlog-status-bad");
+        clearTimeout(reconnectTimer);
+        reconnectTimer = setTimeout(connect, 5000);
+        return;
+    }
+
+    const url = reachable + "/events";
+    setStatus(`Connecting (${reachable})...`, "lmlog-status-warn");
 
     try {
         eventSource = new EventSource(url);
@@ -125,7 +185,7 @@ function connect() {
     }
 
     eventSource.onopen = () => {
-        setStatus("Connected", "lmlog-status-ok");
+        setStatus(`Connected (${reachable})`, "lmlog-status-ok");
     };
 
     eventSource.onmessage = (e) => {
@@ -139,7 +199,9 @@ function connect() {
 
     eventSource.onerror = () => {
         setStatus("Disconnected - retrying...", "lmlog-status-bad");
-        // EventSource auto-retries on its own, but if it's fully closed, retry manually.
+        // EventSource auto-retries the same URL on its own; if it's fully
+        // closed, fall back to re-probing the whole candidate list (in case
+        // the bridge moved to a different address, e.g. Wi-Fi changed).
         if (eventSource && eventSource.readyState === EventSource.CLOSED && !manuallyDisconnected) {
             clearTimeout(reconnectTimer);
             reconnectTimer = setTimeout(connect, 4000);
@@ -192,9 +254,9 @@ function buildSettingsPanel() {
                 <div class="inline-drawer-icon fa-solid fa-circle-chevron-down down"></div>
             </div>
             <div class="inline-drawer-content">
-                <label for="lmlog_url">Bridge URL</label>
-                <input id="lmlog_url" type="text" class="text_pole" placeholder="http://127.0.0.1:6172" />
-                <small>Address of the lmstudio_log_bridge.py script running next to LM Studio. Use your PC's LAN IP (e.g. http://192.168.1.20:6172) if viewing from your phone.</small>
+                <label for="lmlog_url">Bridge URL(s)</label>
+                <textarea id="lmlog_url" class="text_pole" rows="2" placeholder="http://127.0.0.1:6172, http://192.168.1.20:6172"></textarea>
+                <small>Comma or newline separated list of addresses for lmstudio_log_bridge.py. Add both your PC's <code>127.0.0.1:6172</code> and its LAN IP (e.g. <code>192.168.1.20:6172</code>) - the extension automatically connects to whichever one responds on the device you're using (PC or phone).</small>
 
                 <label class="checkbox_label" for="lmlog_autoconnect">
                     <input id="lmlog_autoconnect" type="checkbox" />
@@ -231,7 +293,7 @@ function buildSettingsPanel() {
 
     $("#extensions_settings2").append(html);
 
-    $("#lmlog_url").val(settings.bridgeUrl);
+    $("#lmlog_url").val(settings.bridgeUrls);
     $("#lmlog_autoconnect").prop("checked", settings.autoConnect);
     $("#lmlog_show_server").prop("checked", settings.showServer);
     $("#lmlog_show_model").prop("checked", settings.showModel);
@@ -239,7 +301,7 @@ function buildSettingsPanel() {
     $("#lmlog_maxlines").val(settings.maxLines);
 
     $("#lmlog_url").on("change", function () {
-        settings.bridgeUrl = $(this).val().trim();
+        settings.bridgeUrls = $(this).val().trim();
         saveSettings();
     });
     $("#lmlog_autoconnect").on("change", function () {
