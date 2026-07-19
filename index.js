@@ -13,7 +13,7 @@ const defaultSettings = {
     // The extension pings each one and connects to whichever responds first,
     // so the same setting works whether you're on your PC (127.0.0.1 or
     // LAN IP) or your phone (LAN IP only).
-    bridgeUrls: "http://127.0.0.1:6172, http://192.168.1.20:6172",
+    bridgeUrls: "http://127.0.0.1:6172, http://10.0.0.46:6172",
     autoConnect: false,
     // 0 = unlimited: keep every line for the whole session (matches "don't
     // delete any logs"). Set a positive number only if you need to cap
@@ -23,6 +23,8 @@ const defaultSettings = {
     showModel: true,
     autoscroll: true,
     fontSize: 12,
+    // false = full log view, true = minimized token-usage dashboard
+    statsMode: false,
 };
 
 let eventSource = null;
@@ -165,6 +167,8 @@ function handleIncomingEvent(evt) {
     if (passesFilters(evt)) {
         appendLineToDom(evt);
     }
+
+    updateStats(evt);
 }
 
 // Fully re-renders the panel from allEvents, applying current filters.
@@ -186,6 +190,172 @@ function rerenderFromHistory() {
     }
 }
 
+// ---------------------------------------------------------------------
+// Live token-usage stats, parsed from the same verbatim log lines used
+// for the full log view. Parsing is purely additive - it never changes
+// what's stored in allEvents or shown in the full log.
+// ---------------------------------------------------------------------
+
+const RE_RUNNING = /Running chat completion on conversation with (\d+) messages/;
+const RE_MODEL_TAG = /^\s*\[([^\]]+)\]/;
+const RE_STREAMING_START = /Streaming response\.\.\./;
+const RE_FINISHED = /Finished streaming response/;
+const RE_PROGRESS = /Prompt processing progress:\s*([\d.]+)%/;
+const RE_PROMPT_EVAL = /prompt eval time\s*=\s*([\d.]+)\s*ms\s*\/\s*(\d+)\s*tokens\s*\(\s*([\d.]+)\s*ms per token,\s*([\d.]+)\s*tokens per second\)/;
+const RE_GEN_EVAL = /\beval time\s*=\s*([\d.]+)\s*ms\s*\/\s*(\d+)\s*tokens\s*\(\s*([\d.]+)\s*ms per token,\s*([\d.]+)\s*tokens per second\)/;
+const RE_TOTAL = /total time\s*=\s*([\d.]+)\s*ms\s*\/\s*(\d+)\s*tokens/;
+const RE_GRAPHS = /graphs reused\s*=\s*(\d+)/;
+const RE_LIVE_TG = /n_decoded\s*=\s*(\d+),\s*tg\s*=\s*([\d.]+)\s*t\/s,\s*tg_3s\s*=\s*([\d.]+)\s*t\/s/;
+const RE_STOP = /stop processing:\s*n_tokens\s*=\s*(\d+),\s*truncated\s*=\s*(\d+)/;
+
+const defaultStats = {
+    model: null,
+    phase: "idle", // idle | prompt | generating | done
+    conversationMessages: null,
+    promptPct: null,
+    promptTokens: null, promptMs: null, promptTokPerSec: null,
+    genTokensLive: null, genSpeedLive: null,
+    genTokens: null, genMs: null, genTokPerSec: null,
+    totalMs: null, totalTokens: null,
+    graphsReused: null,
+    contextTokens: null, truncated: null,
+    lastLine: "",
+    lastUpdate: null,
+};
+
+let stats = { ...defaultStats };
+
+function resetRequestStats() {
+    // Keep the model name and totals from the last completed request
+    // visible until the new request actually produces fresh numbers -
+    // only the "in-flight" fields reset immediately so the dashboard
+    // doesn't flash to a wall of dashes on every new message.
+    stats.phase = "prompt";
+    stats.promptPct = 0;
+    stats.promptTokens = null;
+    stats.promptMs = null;
+    stats.promptTokPerSec = null;
+    stats.genTokensLive = null;
+    stats.genSpeedLive = null;
+    stats.genTokens = null;
+    stats.genMs = null;
+    stats.genTokPerSec = null;
+    stats.totalMs = null;
+    stats.totalTokens = null;
+    stats.graphsReused = null;
+}
+
+function updateStats(evt) {
+    const text = lineText(evt);
+    if (!text) return;
+
+    let matched = true;
+    let m;
+
+    if ((m = text.match(RE_RUNNING))) {
+        stats.conversationMessages = Number(m[1]);
+        const modelMatch = text.match(RE_MODEL_TAG);
+        if (modelMatch) stats.model = modelMatch[1];
+        resetRequestStats();
+    } else if ((m = text.match(RE_PROGRESS))) {
+        stats.phase = "prompt";
+        stats.promptPct = Number(m[1]);
+    } else if (RE_STREAMING_START.test(text)) {
+        stats.phase = "generating";
+        stats.promptPct = 100;
+    } else if ((m = text.match(RE_LIVE_TG))) {
+        stats.phase = "generating";
+        stats.genTokensLive = Number(m[1]);
+        stats.genSpeedLive = Number(m[3]); // tg_3s: recent/smoothed rate
+    } else if ((m = text.match(RE_PROMPT_EVAL))) {
+        stats.promptMs = Number(m[1]);
+        stats.promptTokens = Number(m[2]);
+        stats.promptTokPerSec = Number(m[4]);
+    } else if ((m = text.match(RE_GEN_EVAL))) {
+        stats.genMs = Number(m[1]);
+        stats.genTokens = Number(m[2]);
+        stats.genTokPerSec = Number(m[4]);
+    } else if ((m = text.match(RE_TOTAL))) {
+        stats.totalMs = Number(m[1]);
+        stats.totalTokens = Number(m[2]);
+    } else if ((m = text.match(RE_GRAPHS))) {
+        stats.graphsReused = Number(m[1]);
+    } else if ((m = text.match(RE_STOP))) {
+        stats.contextTokens = Number(m[1]);
+        stats.truncated = Number(m[2]);
+    } else if (RE_FINISHED.test(text)) {
+        stats.phase = "done";
+    } else {
+        matched = false;
+    }
+
+    if (matched) {
+        stats.lastLine = text.trim();
+        stats.lastUpdate = new Date();
+        renderStats();
+    }
+}
+
+function recomputeStatsFromHistory() {
+    stats = { ...defaultStats };
+    for (const evt of allEvents) {
+        updateStats(evt);
+    }
+    renderStats();
+}
+
+function fmtTokSec(v) {
+    return v === null || v === undefined ? "-" : `${v.toFixed(1)} tok/s`;
+}
+function fmtTokens(v) {
+    return v === null || v === undefined ? "-" : String(v);
+}
+function fmtMs(v) {
+    return v === null || v === undefined ? "-" : `${(v / 1000).toFixed(2)}s`;
+}
+
+const PHASE_LABELS = {
+    idle: "Idle",
+    prompt: "Processing Prompt",
+    generating: "Generating",
+    done: "Done",
+};
+
+function renderStats() {
+    if (!$("#lmlog_stats_view").length) return; // panel not built yet
+
+    $("#lmlog_stat_model").text(stats.model || "-");
+
+    $("#lmlog_stat_phase")
+        .text(stats.phase === "prompt" ? `${PHASE_LABELS.prompt} (${(stats.promptPct ?? 0).toFixed(0)}%)` : PHASE_LABELS[stats.phase])
+        .attr("class", `lmlog-phase-badge lmlog-phase-${stats.phase}`);
+
+    const pct = stats.phase === "idle" ? 0 : Math.max(0, Math.min(100, stats.promptPct ?? (stats.phase === "generating" || stats.phase === "done" ? 100 : 0)));
+    $("#lmlog_progress_fill").css("width", pct + "%");
+    $("#lmlog_progress_text").text(pct.toFixed(0) + "%");
+
+    $("#lmlog_stat_prompt_tokens").text(fmtTokens(stats.promptTokens));
+    $("#lmlog_stat_prompt_speed").text(fmtTokSec(stats.promptTokPerSec));
+
+    // Prefer the final generation numbers once available; fall back to the
+    // live tg_3s estimate while a response is still streaming.
+    const genTokensDisplay = stats.genTokens ?? stats.genTokensLive;
+    const genSpeedDisplay = stats.genTokPerSec ?? stats.genSpeedLive;
+    $("#lmlog_stat_gen_tokens").text(fmtTokens(genTokensDisplay) + (stats.genTokens === null && stats.genTokensLive !== null ? " (live)" : ""));
+    $("#lmlog_stat_gen_speed").text(fmtTokSec(genSpeedDisplay) + (stats.genTokPerSec === null && stats.genSpeedLive !== null ? " (live)" : ""));
+
+    $("#lmlog_stat_total_time").text(stats.totalMs !== null ? `${fmtMs(stats.totalMs)} / ${fmtTokens(stats.totalTokens)} tok` : "-");
+    $("#lmlog_stat_context").text(
+        stats.contextTokens !== null
+            ? `${fmtTokens(stats.contextTokens)}${stats.truncated ? " (truncated)" : ""}`
+            : "-",
+    );
+    $("#lmlog_stat_messages").text(fmtTokens(stats.conversationMessages));
+    $("#lmlog_stat_lastline").text(stats.lastLine || "-");
+    $("#lmlog_stat_updated").text(stats.lastUpdate ? stats.lastUpdate.toLocaleTimeString() : "-");
+}
+
+
 async function connect() {
     const settings = getSettings();
     manuallyDisconnected = false;
@@ -197,7 +367,16 @@ async function connect() {
         return;
     }
 
-    setStatus(`Checking ${candidates.length} address(es)...`, "lmlog-status-warn");
+    // The bridge (lmstudio_log_bridge.py) only ever speaks plain HTTP. If
+    // SillyTavern itself was loaded over HTTPS, the browser will silently
+    // block any http:// request as "mixed content" - which looks identical
+    // to "unreachable" unless we call it out explicitly.
+    if (window.location.protocol === "https:" && candidates.every((u) => u.startsWith("http://"))) {
+        setStatus("Page is https:// but bridge URLs are http:// - browser may block this (mixed content)", "lmlog-status-bad");
+    } else {
+        setStatus(`Checking ${candidates.length} address(es)...`, "lmlog-status-warn");
+    }
+
     const reachable = await pickReachableUrl(candidates);
 
     if (manuallyDisconnected) return; // user hit disconnect while we were probing
@@ -259,6 +438,8 @@ function disconnect(silent) {
 function clearLog() {
     allEvents = [];
     $("#lmlog_content").empty();
+    stats = { ...defaultStats };
+    renderStats();
 }
 
 function exportLog() {
@@ -374,14 +555,41 @@ function buildFloatingPanel() {
             <span>LM Studio Logs</span>
             <span id="lmlog_status_mini" class="lmlog-status-bad">●</span>
             <span class="lmlog-spacer"></span>
+            <button id="lmlog_panel_minimize" class="lmlog-icon-btn" title="Toggle token-usage view"><i class="fa-solid fa-gauge-high"></i></button>
             <button id="lmlog_panel_clear" class="lmlog-icon-btn" title="Clear"><i class="fa-solid fa-broom"></i></button>
             <button id="lmlog_panel_export" class="lmlog-icon-btn" title="Export"><i class="fa-solid fa-download"></i></button>
             <button id="lmlog_panel_close" class="lmlog-icon-btn" title="Close"><i class="fa-solid fa-xmark"></i></button>
         </div>
-        <div class="lmlog-panel-toolbar">
+        <div id="lmlog_panel_toolbar" class="lmlog-panel-toolbar">
             <input id="lmlog_filter" type="text" placeholder="Filter text..." class="text_pole" />
         </div>
         <div id="lmlog_content" class="lmlog-content"></div>
+
+        <div id="lmlog_stats_view" class="lmlog-stats-view lmlog-hidden">
+            <div class="lmlog-stats-row">
+                <span class="lmlog-stats-label">Model</span>
+                <span id="lmlog_stat_model">-</span>
+            </div>
+            <div class="lmlog-stats-row">
+                <span class="lmlog-stats-label">Status</span>
+                <span id="lmlog_stat_phase" class="lmlog-phase-badge lmlog-phase-idle">Idle</span>
+            </div>
+            <div class="lmlog-progress-wrap">
+                <div class="lmlog-progress-bar"><div id="lmlog_progress_fill" class="lmlog-progress-fill" style="width:0%"></div></div>
+                <span id="lmlog_progress_text">0%</span>
+            </div>
+            <div class="lmlog-stats-grid">
+                <div class="lmlog-stats-cell"><span class="lmlog-stats-label">Prompt tokens</span><span id="lmlog_stat_prompt_tokens">-</span></div>
+                <div class="lmlog-stats-cell"><span class="lmlog-stats-label">Prompt speed</span><span id="lmlog_stat_prompt_speed">-</span></div>
+                <div class="lmlog-stats-cell"><span class="lmlog-stats-label">Gen tokens</span><span id="lmlog_stat_gen_tokens">-</span></div>
+                <div class="lmlog-stats-cell"><span class="lmlog-stats-label">Gen speed</span><span id="lmlog_stat_gen_speed">-</span></div>
+                <div class="lmlog-stats-cell"><span class="lmlog-stats-label">Total time</span><span id="lmlog_stat_total_time">-</span></div>
+                <div class="lmlog-stats-cell"><span class="lmlog-stats-label">Context (n_tokens)</span><span id="lmlog_stat_context">-</span></div>
+                <div class="lmlog-stats-cell"><span class="lmlog-stats-label">Messages</span><span id="lmlog_stat_messages">-</span></div>
+                <div class="lmlog-stats-cell"><span class="lmlog-stats-label">Updated</span><span id="lmlog_stat_updated">-</span></div>
+            </div>
+            <div class="lmlog-stats-lastline">Last: <span id="lmlog_stat_lastline">-</span></div>
+        </div>
     </div>
     <div id="lmlog_toggle_btn" class="lmlog-toggle-btn" title="LM Studio Logs">
         <i class="fa-solid fa-terminal"></i>
@@ -393,11 +601,33 @@ function buildFloatingPanel() {
     $("#lmlog_toggle_btn").on("click", togglePanel);
     $("#lmlog_panel_clear").on("click", clearLog);
     $("#lmlog_panel_export").on("click", exportLog);
+    $("#lmlog_panel_minimize").on("click", toggleStatsMode);
     $("#lmlog_filter").on("input", () => {
         rerenderFromHistory();
     });
 
+    applyStatsMode(getSettings().statsMode);
+
     makeDraggable($("#lmlog_panel_header"), $("#lmlog_panel"));
+}
+
+function applyStatsMode(enabled) {
+    $("#lmlog_panel").toggleClass("lmlog-stats-active", !!enabled);
+    $("#lmlog_content, #lmlog_panel_toolbar").toggleClass("lmlog-hidden", !!enabled);
+    $("#lmlog_stats_view").toggleClass("lmlog-hidden", !enabled);
+    $("#lmlog_panel_minimize i")
+        .attr("class", enabled ? "fa-solid fa-list" : "fa-solid fa-gauge-high");
+    $("#lmlog_panel_minimize").attr("title", enabled ? "Show full log" : "Toggle token-usage view");
+    if (enabled) {
+        recomputeStatsFromHistory();
+    }
+}
+
+function toggleStatsMode() {
+    const settings = getSettings();
+    settings.statsMode = !settings.statsMode;
+    saveSettings();
+    applyStatsMode(settings.statsMode);
 }
 
 function openPanel() {
@@ -414,6 +644,17 @@ function makeDraggable($handle, $target) {
     let startX, startY, startLeft, startTop, dragging = false;
 
     function pointerDown(e) {
+        // Let taps/clicks on buttons and inputs inside the header behave
+        // normally - previously this handler always fired first and called
+        // preventDefault(), which silently swallowed the click event mobile
+        // browsers synthesize after touchend, making the close/export/clear
+        // buttons appear dead on touchscreens (desktop mouse clicks aren't
+        // affected by preventDefault on an earlier mousedown, which is why
+        // it only showed up on mobile).
+        if ($(e.target).closest("button, .lmlog-icon-btn, input, select, textarea, a").length) {
+            return;
+        }
+
         dragging = true;
         const point = e.touches ? e.touches[0] : e;
         startX = point.clientX;

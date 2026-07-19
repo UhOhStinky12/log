@@ -58,6 +58,32 @@ So this extension is one half of a pair:
   only hide non-matching lines - they don't discard anything, so
   clearing a filter brings everything back.
 
+## Token-usage / minimize view
+
+Click the gauge icon in the panel header to switch from the full log to a
+live dashboard: model name, current phase (Idle / Processing Prompt /
+Generating / Done), a prompt-processing progress bar, prompt & generation
+token speeds, total time, and context size (`n_tokens`) - all parsed live
+from the same log lines, updating as a request runs. Click the icon again
+(now a list icon) to go back to the full log. Nothing is lost either way -
+the full log keeps recording in the background regardless of which view is
+showing.
+
+## Troubleshooting
+
+- **Buttons (X / download / clear) don't respond on mobile**: fixed as of
+  this version - previously the panel's drag handler was swallowing taps on
+  those buttons. Update to the latest `index.js`/`style.css` if you're still
+  seeing this.
+- **"No reachable bridge" even though the bridge is running**: the bridge
+  only ever speaks plain `http://`, never `https://`. Double check your
+  Bridge URL(s) use `http://`, not `https://`. Also, if SillyTavern itself
+  is loaded over `https://`, browsers block plain `http://` requests as
+  "mixed content" - the extension will now say this explicitly in the
+  status line rather than just "unreachable". In that case, load
+  SillyTavern over `http://` instead, or put a TLS-terminating reverse
+  proxy in front of the bridge and use its `https://` address.
+
 ## Notes
 
 - Your phone needs to be able to reach that PC's IP/port - i.e. the same
